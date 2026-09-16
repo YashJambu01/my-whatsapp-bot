@@ -1,7 +1,6 @@
 import os
 import json
-from datetime import datetime
-import pytz
+from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, Form, Response
 from twilio.twiml.messaging_response import MessagingResponse
 from google import genai
@@ -11,42 +10,45 @@ from googleapiclient.discovery import build
 
 app = FastAPI()
 
-# 1. Environment & API Setup
-GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
+# Indian Standard Time offset (UTC+5:30) using built-in standard library
+IST = timezone(timedelta(hours=5, minutes=30))
+
+GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "")
 CALENDAR_ID = os.environ.get("CALENDAR_ID", "primary")
 SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
 
-ai_client = genai.Client(api_key=GEMINI_KEY)
+ai_client = genai.Client(api_key=GEMINI_KEY) if GEMINI_KEY else None
 
-# Initialize Google Workspace Services
 def get_google_services():
     if not SERVICE_ACCOUNT_JSON:
         return None, None
-    info = json.loads(SERVICE_ACCOUNT_JSON)
-    creds = service_account.Credentials.from_service_account_info(
-        info,
-        scopes=[
-            "https://www.googleapis.com/auth/calendar",
-            "https://www.googleapis.com/auth/spreadsheets"
-        ]
-    )
-    calendar_service = build("calendar", "v3", credentials=creds)
-    sheets_service = build("sheets", "v4", credentials=creds)
-    return calendar_service, sheets_service
+    try:
+        info = json.loads(SERVICE_ACCOUNT_JSON)
+        creds = service_account.Credentials.from_service_account_info(
+            info,
+            scopes=[
+                "https://www.googleapis.com/auth/calendar",
+                "https://www.googleapis.com/auth/spreadsheets"
+            ]
+        )
+        cal = build("calendar", "v3", credentials=creds)
+        sheets = build("sheets", "v4", credentials=creds)
+        return cal, sheets
+    except Exception:
+        return None, None
 
-# 2. Tool 1: Add Event to Google Calendar
 def add_calendar_event(summary: str, start_datetime: str, end_datetime: str, description: str = "") -> str:
-    """Adds a study session, task, or research event to Google Calendar.
+    """Adds a study session or task event to Google Calendar.
     Args:
-        summary: Title of the event (e.g., 'CA Final AFM Forex Practice').
-        start_datetime: Event start in ISO format 'YYYY-MM-DDTHH:MM:SS' (e.g., '2026-09-17T16:00:00').
-        end_datetime: Event end in ISO format 'YYYY-MM-DDTHH:MM:SS' (e.g., '2026-09-17T18:00:00').
-        description: Details or notes about the study session.
+        summary: Title of the event (e.g. 'CA Final AFM Practice').
+        start_datetime: Event start in ISO format 'YYYY-MM-DDTHH:MM:SS' (e.g. '2026-09-17T16:00:00').
+        end_datetime: Event end in ISO format 'YYYY-MM-DDTHH:MM:SS' (e.g. '2026-09-17T18:00:00').
+        description: Notes about the session.
     """
     cal_service, _ = get_google_services()
     if not cal_service:
-        return "Google Calendar is not configured."
+        return "Google Calendar service account is not yet configured in Render environment."
     try:
         event = {
             "summary": summary,
@@ -54,47 +56,41 @@ def add_calendar_event(summary: str, start_datetime: str, end_datetime: str, des
             "start": {"dateTime": f"{start_datetime}+05:30", "timeZone": "Asia/Kolkata"},
             "end": {"dateTime": f"{end_datetime}+05:30", "timeZone": "Asia/Kolkata"},
         }
-        created = cal_service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
-        return f"Event successfully created in Google Calendar: '{summary}' on {start_datetime}."
+        cal_service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
+        return f"Created Calendar Event: '{summary}' on {start_datetime}."
     except Exception as e:
-        return f"Failed to create calendar event: {str(e)}"
+        return f"Error creating event: {str(e)}"
 
-# 3. Tool 2: Log Task or Session to Progress Sheet
 def log_progress_to_sheet(task: str, category: str, status: str, hours_spent: float, notes: str = "") -> str:
-    """Logs a completed or in-progress study/research task into the Google Sheet progress tracker.
+    """Logs a completed or in-progress study/research task into the progress sheet.
     Args:
-        task: Name of the task or chapter (e.g., 'Ind AS 115 Revenue Recognition').
-        category: 'CA Final' or 'Policy Research' or 'General'.
+        task: Name of the task or chapter.
+        category: 'CA Final' or 'Policy Research'.
         status: 'Completed', 'In Progress', or 'Pending'.
-        hours_spent: Number of hours spent (e.g., 2.5).
-        notes: Any takeaways or observations.
+        hours_spent: Hours spent (e.g. 2.5).
+        notes: Key takeaways or notes.
     """
     _, sheets_service = get_google_services()
     if not sheets_service or not SPREADSHEET_ID:
-        return "Google Sheets is not configured."
+        return "Google Sheets ID or Service Account is not yet configured in Render environment."
     try:
-        today_str = datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d")
+        today_str = datetime.now(IST).strftime("%Y-%m-%d")
         values = [[today_str, task, category, status, str(hours_spent), notes]]
-        body = {"values": values}
         sheets_service.spreadsheets().values().append(
             spreadsheetId=SPREADSHEET_ID,
             range="Sheet1!A:F",
             valueInputOption="USER_ENTERED",
-            body=body
+            body={"values": values}
         ).execute()
-        return f"Task logged in tracker sheet: '{task}' ({hours_spent} hrs, {status})."
+        return f"Logged to tracker sheet: '{task}' ({hours_spent} hrs, {status})."
     except Exception as e:
-        return f"Failed to log task to Sheet: {str(e)}"
+        return f"Error logging to sheet: {str(e)}"
 
-# 4. Tool 3: Generate Summary Report from Sheet
-def get_progress_report(days_back: int = 7) -> str:
-    """Reads the Google Sheet and produces a summary progress report of study and research activities.
-    Args:
-        days_back: Number of days to include in the progress report (default 7 for weekly report).
-    """
+def get_progress_report() -> str:
+    """Reads the Google Sheet and produces a summary report of past study sessions."""
     _, sheets_service = get_google_services()
     if not sheets_service or not SPREADSHEET_ID:
-        return "Google Sheets is not configured."
+        return "Google Sheets is not yet configured."
     try:
         result = sheets_service.spreadsheets().values().get(
             spreadsheetId=SPREADSHEET_ID,
@@ -102,13 +98,13 @@ def get_progress_report(days_back: int = 7) -> str:
         ).execute()
         rows = result.get("values", [])
         if not rows:
-            return "No entries logged in the sheet yet."
+            return "No entries recorded in tracker yet."
         summary = "Tracker Data:\n"
-        for r in rows[-15:]:  # show recent 15 entries
-            summary += f"- {r[0]} | {r[1]} ({r[2]}): {r[3]}, {r[4]} hrs. Notes: {r[5] if len(r) > 5 else ''}\n"
+        for r in rows[-10:]:
+            summary += f"- {r[0]} | {r[1]} ({r[2]}): {r[3]}, {r[4]} hrs. Notes: {r[5] if len(r)>5 else ''}\n"
         return summary
     except Exception as e:
-        return f"Failed to read sheet data: {str(e)}"
+        return f"Error reading sheet: {str(e)}"
 
 AVAILABLE_TOOLS = [add_calendar_event, log_progress_to_sheet, get_progress_report]
 
@@ -125,20 +121,16 @@ async def whatsapp_webhook(Body: str = Form(""), From: str = Form("")):
         twiml.message("Please send a message.")
         return Response(content=str(twiml), media_type="application/xml")
 
-    # Current IST timestamp so the bot understands relative terms like 'today', 'tomorrow 4 PM'
-    now_ist = datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%A, %Y-%m-%d %I:%M %p")
+    now_str = datetime.now(IST).strftime("%A, %Y-%m-%d %I:%M %p")
     system_prompt = f"""
-You are a personal assistant for a CA Final student and political researcher.
-Current Date & Time in India: {now_ist}.
+You are a study and research personal assistant.
+Current Date & Time in India: {now_str}.
 Timezone: Asia/Kolkata (IST).
 
-Capabilities:
-1. Answer conceptual CA Final questions (FR, AFM, Auditing, Tax) and policy/research questions.
-2. If asked to schedule, set a task, or plan a study session, call `add_calendar_event`. Calculate the exact start and end ISO datetimes based on the current date/time above.
-3. If the user reports finishing a study session, practicing sums, or reading a paper, call `log_progress_to_sheet`.
-4. If asked for a daily or weekly progress report, call `get_progress_report` and summarize their total study hours, topics covered, and remaining tasks clearly.
-
-Keep final WhatsApp responses crisp, structured, and easy to read on mobile.
+1. If asked conceptual questions on CA Final (FR, AFM, Audit, Tax) or political research, answer concisely and clearly.
+2. If asked to schedule a study session or task, call `add_calendar_event` with ISO datetimes.
+3. If reporting study progress or completed sums, call `log_progress_to_sheet`.
+4. If asked for a report, call `get_progress_report` and summarize hours and subjects.
 """
     try:
         response = ai_client.models.generate_content(
@@ -158,5 +150,4 @@ Keep final WhatsApp responses crisp, structured, and easy to read on mobile.
         answer = answer[:1450] + "\n\n...[Truncated]"
 
     twiml.message(answer)
-    return Response(content=str(twiml), media_type="application/xml")
     return Response(content=str(twiml), media_type="application/xml")
