@@ -5,4 +5,3 @@ python-multipart
 google-genai
 google-api-python-client
 google-auth
-pyth
